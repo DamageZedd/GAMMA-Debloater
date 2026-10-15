@@ -4,6 +4,17 @@ A standalone GUI utility for the S.T.A.L.K.E.R. G.A.M.M.A. community to safely a
 
 ---
 
+## 💾 Download
+
+No Python installation required:
+
+- **[Latest GitHub Release (v1.0.0)](https://github.com/DamageZedd/GAMMA-Debloater/releases/latest)**:
+  - 📦 **[GAMMA_Debloater.exe](https://github.com/DamageZedd/GAMMA-Debloater/releases/download/v1.0.0/GAMMA_Debloater.exe)** (Standalone single-file executable)
+  - 🗜️ **[GAMMA_Debloater_v1.0.7z](https://github.com/DamageZedd/GAMMA-Debloater/releases/download/v1.0.0/GAMMA_Debloater_v1.0.7z)** (Compressed 7-Zip package)
+- **Repository Binary**: Also available directly in the [`bin/`](bin/GAMMA_Debloater.exe) folder of this repository.
+
+---
+
 ## Key Features
 
 - **Zero-Config Auto Detection**: Automatically locates your G.A.M.M.A. folder (`C:\GAMMA`), detects installed profiles, and finds secondary drives for backup (e.g. `D:\GAMMA_Debloat_Backup`).
