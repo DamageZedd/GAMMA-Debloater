@@ -7,9 +7,11 @@ and full safety shields for Seasons of the Zone, MO2 separators, and multi-profi
 import os
 import sys
 import json
+import stat
 import shutil
 import subprocess
 import threading
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime
 
@@ -71,17 +73,22 @@ class DebloaterEngine:
     def get_dir_stats(path: Path):
         total_files = 0
         total_bytes = 0
-        try:
-            for root, _, files in os.walk(path):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    try:
-                        total_bytes += os.path.getsize(fp)
-                        total_files += 1
-                    except OSError:
-                        pass
-        except OSError:
-            pass
+        stack = [str(path)]
+        while stack:
+            cur = stack.pop()
+            try:
+                with os.scandir(cur) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                total_files += 1
+                                total_bytes += entry.stat(follow_symlinks=False).st_size
+                            elif entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
         return total_files, total_bytes
 
     @staticmethod
@@ -202,12 +209,9 @@ class DebloaterEngine:
         separators_count = 0
 
         all_mod_dirs = [d for d in mods_dir.iterdir() if d.is_dir()]
-        total_dirs = len(all_mod_dirs)
 
-        for i, d in enumerate(all_mod_dirs, 1):
-            if progress_cb and i % 50 == 0:
-                progress_cb(f"Scanning mods directory ({i}/{total_dirs})...")
-
+        candidate_dirs = []
+        for d in all_mod_dirs:
             if d.name.endswith("_separator"):
                 separators_count += 1
                 continue
@@ -216,39 +220,67 @@ class DebloaterEngine:
                 kept_mods_count += 1
                 continue
 
-            files, bytes_size = cls.get_dir_stats(d)
-            candidate_mods.append({
-                "name": d.name,
-                "path": d,
-                "files": files,
-                "bytes": bytes_size,
-                "size_mb": round(bytes_size / (1024 * 1024), 2),
-                "selected": True,
-            })
+            candidate_dirs.append(d)
+
+        total_cands = len(candidate_dirs)
+        src_dl = gamma_path / "downloads"
+        need_dl = src_dl.is_dir() and options.get("include_downloads", True)
+
+        src_mb = gamma_path / "mods_backup"
+        need_mb = src_mb.is_dir() and options.get("include_mods_backup", True)
+
+        all_scan_targets = list(candidate_dirs)
+        dl_idx = None
+        mb_idx = None
+        if need_dl:
+            dl_idx = len(all_scan_targets)
+            all_scan_targets.append(src_dl)
+        if need_mb:
+            mb_idx = len(all_scan_targets)
+            all_scan_targets.append(src_mb)
+
+        if all_scan_targets:
+            if progress_cb:
+                progress_cb(f"Scanning {total_cands} candidate mod trees in parallel...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                stats_results = list(executor.map(cls.get_dir_stats, all_scan_targets))
+
+            for d, (files, bytes_size) in zip(candidate_dirs, stats_results[:total_cands]):
+                candidate_mods.append({
+                    "name": d.name,
+                    "path": d,
+                    "files": files,
+                    "bytes": bytes_size,
+                    "size_mb": round(bytes_size / (1024 * 1024), 2),
+                    "selected": True,
+                })
+
+            if dl_idx is not None:
+                f_cnt, b_cnt = stats_results[dl_idx]
+                dl_stats = {
+                    "count": f_cnt,
+                    "bytes": b_cnt,
+                    "size_gb": round(b_cnt / (1024**3), 2),
+                    "exists": f_cnt > 0,
+                }
+            else:
+                dl_stats = {"count": 0, "bytes": 0, "size_gb": 0.0, "exists": False}
+
+            if mb_idx is not None:
+                f_cnt, b_cnt = stats_results[mb_idx]
+                mb_stats = {
+                    "count": f_cnt,
+                    "bytes": b_cnt,
+                    "size_gb": round(b_cnt / (1024**3), 2),
+                    "exists": f_cnt > 0,
+                }
+            else:
+                mb_stats = {"count": 0, "bytes": 0, "size_gb": 0.0, "exists": False}
+        else:
+            dl_stats = {"count": 0, "bytes": 0, "size_gb": 0.0, "exists": False}
+            mb_stats = {"count": 0, "bytes": 0, "size_gb": 0.0, "exists": False}
 
         candidate_mods.sort(key=lambda x: x["bytes"], reverse=True)
-
-        dl_stats = {"count": 0, "bytes": 0, "size_gb": 0.0, "exists": False}
-        src_dl = gamma_path / "downloads"
-        if src_dl.is_dir() and options.get("include_downloads", True):
-            f_cnt, b_cnt = cls.get_dir_stats(src_dl)
-            dl_stats = {
-                "count": f_cnt,
-                "bytes": b_cnt,
-                "size_gb": round(b_cnt / (1024**3), 2),
-                "exists": f_cnt > 0,
-            }
-
-        mb_stats = {"count": 0, "bytes": 0, "size_gb": 0.0, "exists": False}
-        src_mb = gamma_path / "mods_backup"
-        if src_mb.is_dir() and options.get("include_mods_backup", True):
-            f_cnt, b_cnt = cls.get_dir_stats(src_mb)
-            mb_stats = {
-                "count": f_cnt,
-                "bytes": b_cnt,
-                "size_gb": round(b_cnt / (1024**3), 2),
-                "exists": f_cnt > 0,
-            }
 
         return {
             "gamma_path": gamma_path,
@@ -266,10 +298,27 @@ class DebloaterEngine:
     def safe_rmtree(path: Path):
         if not path.exists():
             return
-        subprocess.run(["cmd", "/c", "rd", "/s", "/q", str(path)], capture_output=True)
+        
+        def _handle_readonly(func, f_path, exc_info):
+            try:
+                os.chmod(f_path, stat.S_IWRITE | stat.S_IREAD)
+                func(f_path)
+            except Exception:
+                pass
+
+        try:
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(path, onexc=lambda func, p, exc: _handle_readonly(func, p, exc))
+            else:
+                shutil.rmtree(path, onerror=_handle_readonly)
+        except Exception:
+            pass
+
         if path.exists():
-            subprocess.run(f'attrib -R "{path}\\*.*" /S /D', shell=True, capture_output=True)
             subprocess.run(["cmd", "/c", "rd", "/s", "/q", str(path)], capture_output=True)
+            if path.exists():
+                subprocess.run(f'attrib -R "{path}\\*.*" /S /D', shell=True, capture_output=True)
+                subprocess.run(["cmd", "/c", "rd", "/s", "/q", str(path)], capture_output=True)
         if path.exists():
             raise RuntimeError(f"Failed to delete directory: {path}")
 
@@ -376,6 +425,24 @@ class DebloaterEngine:
             report(current_step, moving_desc, item=moving_desc, phase=phase_str, mod_idx=i)
             log_cb(f"[{now_str}] [TRANSFERRING {i}/{len(selected_mods)}] {mod['name']} ({size_mb} MB, {src_files} files)...")
 
+            is_same_drive = (src_folder.drive.upper() == dst_folder.drive.upper())
+            if is_same_drive:
+                try:
+                    if dst_folder.exists():
+                        cls.safe_rmtree(dst_folder)
+                    os.replace(src_folder, dst_folder)
+                    bytes_transferred += src_bytes
+                    total_mod_bytes_freed += src_bytes
+                    moved_manifest.append(mod)
+
+                    cum_gb = round(bytes_transferred / (1024**3), 2)
+                    verified_desc = f"[{i}/{len(selected_mods)}] Relocated: {mod['name']} (+{size_mb} MB)"
+                    report(current_step, verified_desc, item=verified_desc, phase=phase_str, mod_idx=i)
+                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✓ INSTANT ZERO-COPY MOVE] {mod['name']} (+{size_mb} MB | Freed: {cum_gb} GB / {total_work_gb} GB)")
+                    continue
+                except OSError:
+                    pass
+
             try:
                 cls._robocopy(src_folder, dst_folder)
             except Exception as e:
@@ -412,26 +479,50 @@ class DebloaterEngine:
             
             src_dl = gamma_path / "downloads"
             dst_dl = backup_dir / "downloads"
-            try:
-                cls._robocopy(src_dl, dst_dl)
-                d_f, d_b = cls.get_dir_stats(dst_dl)
-                if d_f == s_f and d_b == s_b:
-                    for item in src_dl.iterdir():
-                        if item.is_file():
-                            try:
-                                item.unlink()
-                            except OSError:
-                                subprocess.run(f'cmd /c del /f /q "{item}"', shell=True, capture_output=True)
-                        elif item.is_dir():
-                            cls.safe_rmtree(item)
+            dst_dl.mkdir(parents=True, exist_ok=True)
+            
+            is_same_drive = (src_dl.drive.upper() == dst_dl.drive.upper())
+            if is_same_drive:
+                try:
+                    moved_cnt = 0
+                    for item in list(src_dl.iterdir()):
+                        target_item = dst_dl / item.name
+                        if target_item.exists():
+                            if target_item.is_dir():
+                                cls.safe_rmtree(target_item)
+                            else:
+                                target_item.unlink()
+                        os.replace(item, target_item)
+                        moved_cnt += 1
                     dl_bytes_freed = s_b
                     bytes_transferred += s_b
                     cum_gb = round(bytes_transferred / (1024**3), 2)
-                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✓ VERIFIED & PURGED] Downloads cache relocated (+{s_gb} GB freed | Freed: {cum_gb} GB / {total_work_gb} GB)")
-                else:
-                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✗ MISMATCH] Downloads verification mismatch (Src: {s_f} files, Dst: {d_f} files). Source KEPT.")
-            except Exception as e:
-                log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✗ ERROR] Robocopy failed for downloads: {e}. Source NOT deleted.")
+                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✓ INSTANT ZERO-COPY MOVE] Relocated {moved_cnt} download packages (+{s_gb} GB freed | Freed: {cum_gb} GB / {total_work_gb} GB)")
+                except Exception as e:
+                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [WARN] Fast move encountered issue ({e}), falling back to Robocopy stream...")
+                    is_same_drive = False
+
+            if not is_same_drive:
+                try:
+                    cls._robocopy(src_dl, dst_dl)
+                    d_f, d_b = cls.get_dir_stats(dst_dl)
+                    if d_f == s_f and d_b == s_b:
+                        for item in src_dl.iterdir():
+                            if item.is_file():
+                                try:
+                                    item.unlink()
+                                except OSError:
+                                    subprocess.run(f'cmd /c del /f /q "{item}"', shell=True, capture_output=True)
+                            elif item.is_dir():
+                                cls.safe_rmtree(item)
+                        dl_bytes_freed = s_b
+                        bytes_transferred += s_b
+                        cum_gb = round(bytes_transferred / (1024**3), 2)
+                        log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✓ VERIFIED & PURGED] Downloads cache relocated (+{s_gb} GB freed | Freed: {cum_gb} GB / {total_work_gb} GB)")
+                    else:
+                        log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✗ MISMATCH] Downloads verification mismatch (Src: {s_f} files, Dst: {d_f} files). Source KEPT.")
+                except Exception as e:
+                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✗ ERROR] Robocopy failed for downloads: {e}. Source NOT deleted.")
 
         # 4. Move mods_backup
         mb_bytes_freed = 0
@@ -448,19 +539,35 @@ class DebloaterEngine:
             
             src_mb = gamma_path / "mods_backup"
             dst_mb = backup_dir / "mods_backup"
-            try:
-                cls._robocopy(src_mb, dst_mb)
-                d_f, d_b = cls.get_dir_stats(dst_mb)
-                if d_f == s_f and d_b == s_b:
-                    cls.safe_rmtree(src_mb)
+            
+            is_same_drive = (src_mb.drive.upper() == dst_mb.drive.upper())
+            if is_same_drive:
+                try:
+                    if dst_mb.exists():
+                        cls.safe_rmtree(dst_mb)
+                    os.replace(src_mb, dst_mb)
                     mb_bytes_freed = s_b
                     bytes_transferred += s_b
                     cum_gb = round(bytes_transferred / (1024**3), 2)
-                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✓ VERIFIED & PURGED] Legacy backups relocated (+{s_gb} GB freed | Freed: {cum_gb} GB / {total_work_gb} GB)")
-                else:
-                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✗ MISMATCH] Legacy backups verification mismatch (Src: {s_f} files, Dst: {d_f} files). Source KEPT.")
-            except Exception as e:
-                log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✗ ERROR] Robocopy failed for legacy backups: {e}. Source NOT deleted.")
+                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✓ INSTANT ZERO-COPY MOVE] Legacy backups relocated (+{s_gb} GB freed | Freed: {cum_gb} GB / {total_work_gb} GB)")
+                except Exception as e:
+                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [WARN] Fast move encountered issue ({e}), falling back to Robocopy stream...")
+                    is_same_drive = False
+
+            if not is_same_drive:
+                try:
+                    cls._robocopy(src_mb, dst_mb)
+                    d_f, d_b = cls.get_dir_stats(dst_mb)
+                    if d_f == s_f and d_b == s_b:
+                        cls.safe_rmtree(src_mb)
+                        mb_bytes_freed = s_b
+                        bytes_transferred += s_b
+                        cum_gb = round(bytes_transferred / (1024**3), 2)
+                        log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✓ VERIFIED & PURGED] Legacy backups relocated (+{s_gb} GB freed | Freed: {cum_gb} GB / {total_work_gb} GB)")
+                    else:
+                        log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✗ MISMATCH] Legacy backups verification mismatch (Src: {s_f} files, Dst: {d_f} files). Source KEPT.")
+                except Exception as e:
+                    log_cb(f"[{datetime.now().strftime('%H:%M:%S')}]   [✗ ERROR] Robocopy failed for legacy backups: {e}. Source NOT deleted.")
 
         # 5. Generate Manifest, Restore Script, and Documentation
         current_step += 1
@@ -494,7 +601,7 @@ class DebloaterEngine:
     @staticmethod
     def _robocopy(src: Path, dst: Path):
         dst.mkdir(parents=True, exist_ok=True)
-        cmd = ["robocopy", str(src), str(dst), "/E", "/MT:16", "/R:1", "/W:1", "/NP", "/NDL", "/NFL"]
+        cmd = ["robocopy", str(src), str(dst), "/E", "/MT:32", "/R:0", "/W:0", "/J", "/NP", "/NDL", "/NFL"]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode >= 8:
             raise RuntimeError(f"Robocopy failed code {res.returncode}:\n{res.stderr or res.stdout}")
@@ -570,7 +677,7 @@ $srcMods = Join-Path $backupDir "mods"
 $dstMods = Join-Path $gammaDir "mods"
 if (Test-Path $srcMods) {{
     Write-Host "`nRestoring mod folders to $dstMods..." -ForegroundColor Yellow
-    robocopy $srcMods $dstMods /E /MOVE /MT:8 /NP /NDL /NFL | Out-Null
+    robocopy $srcMods $dstMods /E /MOVE /MT:32 /J /R:0 /W:0 /NP /NDL /NFL | Out-Null
 }}
 
 # 2. Restore downloads
@@ -578,7 +685,7 @@ $srcDl = Join-Path $backupDir "downloads"
 $dstDl = Join-Path $gammaDir "downloads"
 if (Test-Path $srcDl) {{
     Write-Host "`nRestoring downloads to $dstDl..." -ForegroundColor Yellow
-    robocopy $srcDl $dstDl /E /MOVE /MT:8 /NP /NDL /NFL | Out-Null
+    robocopy $srcDl $dstDl /E /MOVE /MT:32 /J /R:0 /W:0 /NP /NDL /NFL | Out-Null
 }}
 
 # 3. Restore mods_backup
@@ -586,7 +693,7 @@ $srcMb = Join-Path $backupDir "mods_backup"
 $dstMb = Join-Path $gammaDir "mods_backup"
 if (Test-Path $srcMb) {{
     Write-Host "`nRestoring mods_backup to $dstMb..." -ForegroundColor Yellow
-    robocopy $srcMb $dstMb /E /MOVE /MT:8 /NP /NDL /NFL | Out-Null
+    robocopy $srcMb $dstMb /E /MOVE /MT:32 /J /R:0 /W:0 /NP /NDL /NFL | Out-Null
 }}
 
 # 4. Restore profiles (modlist.txt, load orders)
@@ -594,7 +701,7 @@ $srcProf = Join-Path $backupDir "profiles"
 $dstProf = Join-Path $gammaDir "profiles"
 if (Test-Path $srcProf) {{
     Write-Host "`nRestoring profile modlists and configs..." -ForegroundColor Yellow
-    robocopy $srcProf $dstProf /E /MT:8 /NP /NDL /NFL | Out-Null
+    robocopy $srcProf $dstProf /E /MT:32 /J /R:0 /W:0 /NP /NDL /NFL | Out-Null
 }}
 
 Write-Host "`nRESTORE COMPLETE! Everything has been returned to $gammaDir." -ForegroundColor Green
@@ -1812,8 +1919,9 @@ S.T.A.L.K.E.R. G.A.M.M.A. STORAGE OPTIMIZATION PROTOCOL — FIELD MANUAL
         self.lbl_status.configure(text=f"SCAN COMPLETE • {len(cands)} CANDIDATES IDENTIFIED")
 
     def _populate_tree(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        children = self.tree.get_children()
+        if children:
+            self.tree.delete(*children)
 
         if not self.current_plan:
             return
