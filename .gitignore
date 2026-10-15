@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Python Virtual Environments
+.env/
+.venv/
+env/
+venv/
+
+# Temporary / Scratch Image files
+gamma_bg.png
+gamma_logo.png
+gamma_logo_cropped.png
+.DS_Store
+Thumbs.db
